@@ -1,0 +1,406 @@
+import numpy as np
+import torch.nn.functional as F
+
+from cliport.utils import utils
+from cliport.agents.transporter import TransporterAgent
+
+from cliport.models.streams.one_stream_attention_lang_fusion import OneStreamAttentionLangFusion
+from cliport.models.streams.one_stream_transport_lang_fusion import OneStreamTransportLangFusion
+from cliport.models.streams.two_stream_attention_lang_fusion import TwoStreamAttentionLangFusion
+from cliport.models.streams.two_stream_transport_lang_fusion import TwoStreamTransportLangFusion
+from cliport.models.streams.two_stream_attention_lang_fusion import TwoStreamAttentionLangFusionLat
+from cliport.models.streams.two_stream_transport_lang_fusion import TwoStreamTransportLangFusionLat
+
+from uncertainty_module.src.base.calib_scaling import CalibScaler
+from uncertainty_module.src.temperature_scaling.temperature_scaling import TemperatureScaler
+
+# UA-VLA-IL: VLM-Adaptive Calibration
+try:
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    from vla_cal import VLACalibrator
+    VLA_CAL_AVAILABLE = True
+except ImportError:
+    VLA_CAL_AVAILABLE = False
+    print("[UA-VLA-IL] vla_cal not found. Falling back to fixed T and ω.")
+
+class TwoStreamClipLingUNetTransporterAgent(TransporterAgent):
+    def __init__(self, name, cfg, train_ds, test_ds):
+        super().__init__(name, cfg, train_ds, test_ds)
+        
+    def _build_model(self):
+        stream_one_fcn = 'plain_resnet'
+        stream_two_fcn = 'clip_lingunet'
+        self.attention = TwoStreamAttentionLangFusion(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=1,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        self.transport = TwoStreamTransportLangFusion(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=self.n_rotations,
+            crop_size=self.crop_size,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        if self.cfg['calibration']['enabled']:
+            # self._optimizers = None
+            
+            if self.cfg['calibration']['calib_type'] == 'temperature':
+                self.calib_scaler = TemperatureScaler(device=self.device_type, cfg=self.cfg)
+            else:
+                self.calib_scaler = CalibScaler(device=self.device_type, cfg=self.cfg)
+
+            if self.cfg['calibration']['training']:
+                self.train_ds = test_ds # in training, test_ds is the validation set, set it to validation set in calibration
+
+        if self.cfg['action_selection']['enabled']:
+            self.action_selection = ActionSelection(device=self.device_type, 
+                                                    batch_size=1,
+                                                    enabled=self.cfg['action_selection']['enabled'],
+                                                    attn_tau=self.cfg['action_selection']['attn_tau'],
+                                                    trans_tau=self.cfg['action_selection']['trans_tau'],
+                                                    attn_uaa=self.cfg['action_selection']['attn_uaa'],
+                                                    trans_uaa=self.cfg['action_selection']['trans_uaa'],
+                                                    masking=self.cfg['action_selection']['masking']
+                                                    )
+
+        # UA-VLA-IL: VLM-adaptive calibrator
+        if VLA_CAL_AVAILABLE and self.cfg.get('vla_cal', {}).get('enabled', False):
+            self.vla_calibrator = VLACalibrator(
+                qwen_port=self.cfg['vla_cal'].get('qwen_port', 12190),
+                model='cliport',
+                t_base=self.cfg['vla_cal'].get('t_base', 1.0),
+                alpha=self.cfg['vla_cal'].get('alpha', 1.5),
+                cache_steps=self.cfg['vla_cal'].get('cache_steps', 5),
+            )
+        else:
+            self.vla_calibrator = None
+
+    def attn_forward(self, inp, softmax=True):
+        inp_img = inp['inp_img']
+        lang_goal = inp['lang_goal']
+
+        out = self.attention.forward(inp_img, lang_goal, softmax=softmax)
+        return out
+
+    def attn_training_step(self, frame, backprop=True, compute_err=False):
+        inp_img = frame['img']
+        p0, p0_theta = frame['p0'], frame['p0_theta']
+        lang_goal = frame['lang_goal']
+
+        inp = {'inp_img': inp_img, 'lang_goal': lang_goal}
+        out = self.attn_forward(inp, softmax=False)
+        return self.attn_criterion(backprop, compute_err, inp, out, p0, p0_theta)
+
+    def trans_forward(self, inp, softmax=True):
+        inp_img = inp['inp_img']
+        p0 = inp['p0']
+        lang_goal = inp['lang_goal']
+
+        out = self.transport.forward(inp_img, p0, lang_goal, softmax=softmax)
+        return out
+
+    def transport_training_step(self, frame, backprop=True, compute_err=False):
+        inp_img = frame['img']
+        p0 = frame['p0']
+        p1, p1_theta = frame['p1'], frame['p1_theta']
+        lang_goal = frame['lang_goal']
+
+        inp = {'inp_img': inp_img, 'p0': p0, 'lang_goal': lang_goal}
+        out = self.trans_forward(inp, softmax=False)
+        err, loss = self.transport_criterion(backprop, compute_err, inp, out, p0, p1, p1_theta)
+        return loss, err
+
+    def act(self, obs, info, goal=None):  # pylint: disable=unused-argument
+        """Run inference and return best action given visual observations."""
+        # Get heightmap from RGB-D images.
+        img = self.test_ds.get_image(obs)
+        lang_goal = info['lang_goal']
+        # import pdb; pdb.set_trace()
+        # breakpoint()
+        if self.cfg['action_selection']['enabled']:
+            img = self.test_ds.get_image(obs)
+            lang_goal = info['lang_goal']
+
+            # UA-VLA-IL: predict adaptive T and ω from VLM ─────────────────
+            if self.vla_calibrator is not None and self.cfg['calibration']['enabled']:
+                obs_rgb = img[:, :, :3].astype(np.uint8)  # (H, W, 3) RGB
+                T, omega = self.vla_calibrator.predict_both(obs_rgb, lang_goal)
+                # Override temperature scalars in-place (no re-training needed)
+                self.calib_scaler.attn_temperature.data.fill_(T)
+                self.calib_scaler.trans_temperature.data.fill_(T)
+                # Update conv kernel size for action selection
+                omega_int = max(1, int(omega))
+                if omega_int % 2 == 0:
+                    omega_int += 1
+                if hasattr(self, 'action_selection'):
+                    self.action_selection._attn_tau = omega_int
+                    self.action_selection._trans_tau = omega_int
+            # ────────────────────────────────────────────────────────────────
+
+            # Attention model forward pass.
+            pick_inp = {'inp_img': img, 'lang_goal': lang_goal}
+            if self.cfg['calibration']['enabled']:
+                output = self.attn_forward(pick_inp, softmax=False)
+                output = self.calib_scaler.scale_attn(output)
+                output = F.softmax(output, dim=-1)
+                
+                in_shape = self.in_shape
+                pick_conf = output.reshape([in_shape[0], in_shape[1], 1])
+            else:
+                pick_conf = self.attn_forward(pick_inp)
+            
+            if self.cfg['action_selection']['attn_uaa']:
+                pick_conf = self.action_selection.get_attn_uncertainty_heatmap(pick_conf.permute(2,0,1).unsqueeze(0))
+                pick_conf = pick_conf.squeeze(0).permute(1,2,0)
+            
+            pick_conf = pick_conf.detach().cpu().numpy()
+            argmax = np.argmax(pick_conf)
+            argmax = np.unravel_index(argmax, shape=pick_conf.shape)
+            p0_pix = argmax[:2]
+            p0_theta = argmax[2] * (2 * np.pi / pick_conf.shape[2])
+
+            # Transport model forward pass.
+            place_inp = {'inp_img': img, 'p0': p0_pix, 'lang_goal': lang_goal}
+            if self.cfg['calibration']['enabled']:
+                output = self.trans_forward(place_inp, softmax=False)
+                output_shape = output.shape
+                output = output.reshape((1, np.prod(output.shape)))
+                output = self.calib_scaler.scale_trans(output)
+                output = F.softmax(output, dim=-1) # add scaling
+                place_conf = output.reshape(output_shape[1:])
+            else:
+                place_conf = self.trans_forward(place_inp)
+            # breakpoint()
+            if self.cfg['action_selection']['trans_uaa']:
+                place_conf = self.action_selection.get_trans_uncertainty_heatmap(place_conf.unsqueeze(0))
+                place_conf = place_conf.squeeze(0)
+            place_conf = place_conf.permute(1, 2, 0)
+            place_conf = place_conf.detach().cpu().numpy()
+            argmax = np.argmax(place_conf)
+            argmax = np.unravel_index(argmax, shape=place_conf.shape)
+            p1_pix = argmax[:2]
+            p1_theta = argmax[2] * (2 * np.pi / place_conf.shape[2])
+        else:
+            # Attention model forward pass.
+            pick_inp = {'inp_img': img, 'lang_goal': lang_goal}
+            pick_conf = self.attn_forward(pick_inp)
+            pick_conf = pick_conf.detach().cpu().numpy()
+            argmax = np.argmax(pick_conf)
+            argmax = np.unravel_index(argmax, shape=pick_conf.shape)
+            p0_pix = argmax[:2]
+            p0_theta = argmax[2] * (2 * np.pi / pick_conf.shape[2])
+
+            # Transport model forward pass.
+            place_inp = {'inp_img': img, 'p0': p0_pix, 'lang_goal': lang_goal}
+            place_conf = self.trans_forward(place_inp)
+            place_conf = place_conf.permute(1, 2, 0)
+            place_conf = place_conf.detach().cpu().numpy()
+            argmax = np.argmax(place_conf)
+            argmax = np.unravel_index(argmax, shape=place_conf.shape)
+            p1_pix = argmax[:2]
+            p1_theta = argmax[2] * (2 * np.pi / place_conf.shape[2])
+
+        # Pixels to end effector poses.
+        hmap = img[:, :, 3]
+        p0_xyz = utils.pix_to_xyz(p0_pix, hmap, self.bounds, self.pix_size)
+        p1_xyz = utils.pix_to_xyz(p1_pix, hmap, self.bounds, self.pix_size)
+        p0_xyzw = utils.eulerXYZ_to_quatXYZW((0, 0, -p0_theta))
+        p1_xyzw = utils.eulerXYZ_to_quatXYZW((0, 0, -p1_theta))
+        # import pdb; pdb.set_trace()
+        return {
+            'pose0': (np.asarray(p0_xyz), np.asarray(p0_xyzw)),
+            'pose1': (np.asarray(p1_xyz), np.asarray(p1_xyzw)),
+            'pick': [p0_pix[0], p0_pix[1], p0_theta],
+            'place': [p1_pix[0], p1_pix[1], p1_theta],
+            'pick_conf': pick_conf,
+            'place_conf': place_conf,
+        }
+
+class TwoStreamClipFilmLingUNetLatTransporterAgent(TwoStreamClipLingUNetTransporterAgent):
+    def __init__(self, name, cfg, train_ds, test_ds):
+        super().__init__(name, cfg, train_ds, test_ds)
+
+    def _build_model(self):
+        stream_one_fcn = 'plain_resnet_lat'
+        stream_two_fcn = 'clip_film_lingunet_lat'
+        self.attention = TwoStreamAttentionLangFusionLat(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=1,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        self.transport = TwoStreamTransportLangFusionLat(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=self.n_rotations,
+            crop_size=self.crop_size,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+
+
+class TwoStreamClipLingUNetLatTransporterAgent(TwoStreamClipLingUNetTransporterAgent):
+    def __init__(self, name, cfg, train_ds, test_ds):
+        super().__init__(name, cfg, train_ds, test_ds)
+
+    def _build_model(self):
+        stream_one_fcn = 'plain_resnet_lat'
+        stream_two_fcn = 'clip_lingunet_lat'
+        self.attention = TwoStreamAttentionLangFusionLat(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=1,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        self.transport = TwoStreamTransportLangFusionLat(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=self.n_rotations,
+            crop_size=self.crop_size,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+
+
+class TwoStreamRN50BertLingUNetTransporterAgent(TwoStreamClipLingUNetTransporterAgent):
+    def __init__(self, name, cfg, train_ds, test_ds):
+        super().__init__(name, cfg, train_ds, test_ds)
+
+    def _build_model(self):
+        stream_one_fcn = 'plain_resnet'
+        stream_two_fcn = 'rn50_bert_lingunet'
+        self.attention = TwoStreamAttentionLangFusion(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=1,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        self.transport = TwoStreamTransportLangFusion(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=self.n_rotations,
+            crop_size=self.crop_size,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+
+
+class TwoStreamUntrainedRN50BertLingUNetTransporterAgent(TwoStreamClipLingUNetTransporterAgent):
+    def __init__(self, name, cfg, train_ds, test_ds):
+        super().__init__(name, cfg, train_ds, test_ds)
+
+    def _build_model(self):
+        stream_one_fcn = 'plain_resnet'
+        stream_two_fcn = 'untrained_rn50_bert_lingunet'
+        self.attention = TwoStreamAttentionLangFusion(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=1,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        self.transport = TwoStreamTransportLangFusion(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=self.n_rotations,
+            crop_size=self.crop_size,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+
+
+class TwoStreamRN50BertLingUNetLatTransporterAgent(TwoStreamClipLingUNetTransporterAgent):
+    def __init__(self, name, cfg, train_ds, test_ds):
+        super().__init__(name, cfg, train_ds, test_ds)
+
+    def _build_model(self):
+        stream_one_fcn = 'plain_resnet_lat'
+        stream_two_fcn = 'rn50_bert_lingunet_lat'
+        self.attention = TwoStreamAttentionLangFusionLat(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=1,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        self.transport = TwoStreamTransportLangFusionLat(
+            stream_fcn=(stream_one_fcn, stream_two_fcn),
+            in_shape=self.in_shape,
+            n_rotations=self.n_rotations,
+            crop_size=self.crop_size,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+
+
+class OriginalTransporterLangFusionAgent(TwoStreamClipLingUNetTransporterAgent):
+
+    def __init__(self, name, cfg, train_ds, test_ds):
+        super().__init__(name, cfg, train_ds, test_ds)
+
+    def _build_model(self):
+        stream_fcn = 'plain_resnet_lang'
+        self.attention = OneStreamAttentionLangFusion(
+            stream_fcn=(stream_fcn, None),
+            in_shape=self.in_shape,
+            n_rotations=1,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        self.transport = OneStreamTransportLangFusion(
+            stream_fcn=(stream_fcn, None),
+            in_shape=self.in_shape,
+            n_rotations=self.n_rotations,
+            crop_size=self.crop_size,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+
+
+
+class ClipLingUNetTransporterAgent(TwoStreamClipLingUNetTransporterAgent):
+
+    def __init__(self, name, cfg, train_ds, test_ds):
+        super().__init__(name, cfg, train_ds, test_ds)
+
+    def _build_model(self):
+        stream_fcn = 'clip_lingunet'
+        self.attention = OneStreamAttentionLangFusion(
+            stream_fcn=(stream_fcn, None),
+            in_shape=self.in_shape,
+            n_rotations=1,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
+        self.transport = OneStreamTransportLangFusion(
+            stream_fcn=(stream_fcn, None),
+            in_shape=self.in_shape,
+            n_rotations=self.n_rotations,
+            crop_size=self.crop_size,
+            preprocess=utils.preprocess,
+            cfg=self.cfg,
+            device=self.device_type,
+        )
