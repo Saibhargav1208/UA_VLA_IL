@@ -52,7 +52,7 @@ _PRECISION_PROMPT = (
 def _extract_float(text: str) -> float:
     """Extract first float from model response and clamp to [0, 1]."""
     text = text.strip()
-    matches = re.findall(r"\d+\.?\d*", text)
+    matches = re.findall(r"-?\d+\.?\d*", text)
     if not matches:
         return 0.5  # neutral fallback
     val = float(matches[0])

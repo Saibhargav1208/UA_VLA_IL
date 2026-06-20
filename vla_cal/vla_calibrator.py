@@ -139,8 +139,7 @@ class VLACalibrator:
 
         if self._should_refresh():
             self._refresh(obs_rgb, task)
-        else:
-            self._steps_since_update += 1
+        self._steps_since_update += 1
 
         return self._cached_complexity, self._cached_precision  # type: ignore
 
